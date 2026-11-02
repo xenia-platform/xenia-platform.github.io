@@ -2,11 +2,37 @@
 
 Putting xenia on a Linux host as a service. Xenia runs in the foreground and logs to stderr, so a service manager starts it, restarts it and keeps its log; it never forks itself into the background. The examples use systemd, and say what changes without it.
 
+## Packages
+
+**Debian and Ubuntu.** The package `xenia-server`, `xenia-server_VERSION_amd64.deb` or `_arm64.deb` in each release, sets up what this page describes, and the release's signed `SHA256SUMS` covers it:
+
+- `/usr/bin/xenia`, the static binary of the archives, and the [systemd unit](#systemd) with it;
+- `/etc/xenia`: the example project, root:xenia, 750 and 640. Its files are conffiles, so an upgrade keeps your edits;
+- the system user and group `xenia`, and a [logrotate](#log-rotation) entry, `/etc/logrotate.d/xenia-server`;
+- the service, enabled and started on port 80. If the start fails, say because another server has port 80, the package stays installed and says so: `journalctl -u xenia` tells why. Change the listeners with `systemctl edit xenia`, an `ExecStart=` override.
+
+`apt remove` keeps `/etc/xenia`. `apt purge` removes it, with everything in it (certificates and keys put there too), and the logs. The `xenia` user stays, as Debian keeps system users.
+
+**FreeBSD 14** and later, amd64: the package `xenia-server-VERSION-freebsd-amd64.pkg` in each release, covered by `SHA256SUMS` as well.
+
+```sh
+pkg add ./xenia-server-VERSION-freebsd-amd64.pkg
+sysrc xenia_enable=YES
+service xenia start
+```
+
+- `/usr/local/bin/xenia`, and the rc.d script `xenia`. Its `rc.conf` settings are `xenia_config` (`/usr/local/etc/xenia/xenia.conf.js`), `xenia_args` (the listeners: `--listen 0.0.0.0:80 --listen [::]:80`) and `xenia_serve_user` (`xenia`).
+- It runs xenia under `daemon(8)`, which restarts it and keeps its output in `/var/log/xenia/xenia.log`. xenia starts as root with `--user xenia`, so it binds port 80 and then serves as `xenia`, with no new privileges.
+- `service xenia reload` recompiles the config. The admin socket is `/var/run/xenia/admin.sock`, and the access log is `/var/log/xenia/access.log`, rotated by newsyslog (`/usr/local/etc/newsyslog.conf.d/xenia.conf`).
+- `/usr/local/etc/xenia`: the example project, made from its `.sample` files when there is none, root:xenia, 750 and 640. `pkg delete` keeps a config you edited, and the user.
+
+**Homebrew**, on macOS or Linux: `brew install xenia-platform/tap/xenia-server`. The binary is in `$(brew --prefix)/bin`, and the example project in `$(brew --prefix)/etc/xenia`, which upgrades keep. `brew services start xenia-server` runs it as you on `127.0.0.1:8080`, with its logs in `$(brew --prefix)/var/log/xenia`: for a laptop or a build machine. A public server takes the package, or the archive and the steps below.
+
 ## Layout
 
 | Path | What | Owner, mode |
 | --- | --- | --- |
-| `/usr/local/bin/xenia` | the binary, from a [release archive](index.md#installing) or `cmake --install` | root, 755 |
+| `/usr/local/bin/xenia` | the binary, from a [release archive](index.md#installing) or `cmake --install` (`/usr/bin/xenia` from the [package](#packages)) | root, 755 |
 | `/etc/xenia/xenia.conf.js` | the config, the modules it imports, and certificates and keys | root:xenia, 640 (the directory 750) |
 | `/etc/xenia/admin.token` | the admin token, if the admin interface listens on TCP | xenia, 600 |
 | `/var/log/xenia/access.log` | the [access log](running.md#access-logs) | xenia, in a directory xenia can write |
@@ -72,7 +98,7 @@ Rename the file, then have xenia reopen it: `systemctl kill -s USR2 xenia.servic
 
 ## Behind a load balancer
 
-The client of a request that came through a proxy or load balancer is the address that proxy says it was for. List the proxies in `server.trustedProxies` (addresses or prefixes, up to 64), and xenia takes the client from their `X-Forwarded-For`: for [rate limits](configuration.md#rate-limits), the `X-Forwarded-For` it sends upstream, and the access log's `client` (with `peer`, the proxy). Requests from anywhere else are taken at their own address, whatever they send.
+The client of a request that came through a proxy or load balancer is the address that proxy says it was for. List the proxies in `server.trustedProxies` (addresses or prefixes, up to 64), and xenia takes the client from their `X-Forwarded-For`: for [limits](configuration.md#limits), the `X-Forwarded-For` it sends upstream, and the access log's `client` (with `peer`, the proxy). Requests from anywhere else are taken at their own address, whatever they send.
 
 ```js
 export default defineConfig({
@@ -81,6 +107,8 @@ export default defineConfig({
 });
 ```
 
+The proxies themselves are not counted by `server.maxConnectionsPerClient`, which knows only a connection's own address: behind them, bound each client with a [limit](configuration.md#limits) that has `inFlight`.
+
 ## Without systemd
 
-Any supervisor that runs a foreground process will do (runit, s6, supervisord, a container runtime). Start xenia as root with `--user xenia`, or as the user with file capabilities, and give it the directories above. Without `NOTIFY_SOCKET` nothing is reported; `SIGHUP` reloads, `SIGTERM` drains and exits, and `GET /status` tells how the last reload went.
+Any supervisor that runs a foreground process will do (runit, s6, supervisord, a container runtime; on FreeBSD, the package's rc.d script, [above](#packages)). Start xenia as root with `--user xenia`, or as the user with file capabilities, and give it the directories above. Without `NOTIFY_SOCKET` nothing is reported; `SIGHUP` reloads, `SIGTERM` drains and exits, and `GET /status` tells how the last reload went.

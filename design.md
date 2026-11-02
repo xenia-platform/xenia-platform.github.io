@@ -82,7 +82,7 @@ This avoids fragmentation and simplifies memory ownership.
 
 ## Concurrency Model
 
-- Request path is lock-free, but for what routes opt into sharing between workers: [rate limits](configuration.md#rate-limits) and [response caches](configuration.md#caching), each a striped table locked for a lookup at a time
+- Request path is lock-free, but for what routes opt into sharing between workers: [limits](configuration.md#limits) and [response caches](configuration.md#caching), each a striped table locked for a lookup at a time
 - State is immutable during request execution
 - Besides the snapshot pointer and those tables, the hot path touches only its own worker's counters, access log buffer and small-file cache
 - File I/O runs on libuv's threadpool, shared by the workers; a file response hands its bytes back to its worker's loop

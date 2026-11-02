@@ -33,11 +33,12 @@ export default defineConfig({
 | `proxy` | | forward to this upstream group instead (see [Upstreams and proxying](#upstreams-and-proxying)) |
 | `rewrite` | none | proxy routes: replaces the part of the path the route matched (see [Path rewriting](#upstreams-and-proxying)) |
 | `root` | | serve the files in this directory instead (see [Files](#files)); `index`, `listing`, `precompressed`, `followSymlinks` and `contentTypes` go with it |
+| `file` | | serve this one file instead, on the path or for everything under the prefix (see [Single files](#single-files)); `precompressed`, `followSymlinks` and `contentTypes` go with it |
 | `compress` | `true`, `false` on proxy routes | gzip responses worth it for clients that take it (see [Compression](#compression)) |
 | `allowHttp` | `false` | served over plain HTTP even with `tls.redirect` (see [TLS](#tls)) |
 | `clientCert` | `false` | only to clients with a verified certificate, else `403` (see [Client certificates](#client-certificates)) |
 | `flag` | none | served only while a feature flag is on (`'name'`) or off (`'!name'`) (see [Feature flags](#feature-flags)) |
-| `limit` | none | count each client's requests against this rate limit (see [Rate limits](#rate-limits)) |
+| `limit` | none | count each client's requests against this limit (see [Limits](#limits)) |
 
 An exact `path` beats a `prefix`, and the longest prefix wins. Whichever path matches decides the outcome: a method it has no route for is `405`, not a shorter prefix. Matching is case-sensitive and takes the path as sent; `/a/../b` is not `/b`. Static and file routes take no request body (`413`).
 
@@ -78,7 +79,7 @@ export default defineConfig({ routes: [{ path: '/', body: 'home\n' }, ...pages] 
 cd my-site && xenia types             # xenia.d.ts, and jsconfig.json if there is no project file
 ```
 
-VS Code, and any editor with the TypeScript language server, then completes keys and shows each one's documentation, and marks a misspelled key, a value of the wrong type, and a route that mixes the keys of two kinds (`proxy` with `body`, `root` with `path`): before `xenia check` would. Names that refer to other parts of the config, such as a route's `proxy`, are `xenia check`'s to check. `defineConfig` is what lets them, by giving the export its type; it returns the config as it is. The same check runs anywhere TypeScript does:
+VS Code, and any editor with the TypeScript language server, then completes keys and shows each one's documentation, and marks a misspelled key, a value of the wrong type, and a route that mixes the keys of two kinds (`proxy` with `body`, `root` with `path`): before `xenia check` would. Names that refer to other parts of the config, such as a route's `proxy`, are `xenia check`'s to check. `defineConfig` is what lets them, by giving the export its type; it returns the config as it is. The docs write every config this way; a bare `export default { … }` works too, without the editor's checks. The same check runs anywhere TypeScript does:
 
 ```sh
 npx -p typescript tsc -p jsconfig.json    # in CI, say
@@ -93,11 +94,13 @@ npx -p typescript tsc -p jsconfig.json    # in CI, say
 An optional `server` section sets timeouts and limits. It is part of the snapshot like the routes, so a reload changes it without a restart; connections that are already open follow the new values.
 
 ```js
-export default {
+import { defineConfig } from 'xenia';
+
+export default defineConfig({
   server: { headerTimeout: 10, idleTimeout: 30, writeTimeout: 30,
             maxConnections: 10000, shutdownTimeout: 10 },
   routes: [ ... ],
-};
+});
 ```
 
 | Setting | Default | Meaning |
@@ -106,11 +109,12 @@ export default {
 | `idleTimeout` | 30 s | the keep-alive gap between requests, and the wait for a client to close after the server's final response |
 | `writeTimeout` | 30 s | a queued response must move at least 1 KiB per window, or the connection is aborted. Progress is measured into the kernel, so socket buffers of a few hundred KiB sit between it and the client. |
 | `maxConnections` | 10000 | open connections per process; at the limit the server stops accepting and new connections wait in the kernel backlog. Capped to fit under the open-file limit, which is raised at startup. |
+| `maxConnectionsPerClient` | none | open connections per client address, 1 to 1,000,000; more are closed as soon as they are accepted (see [Limits](#limits)) |
 | `shutdownTimeout` | 10 s | how long a drain waits for in-flight responses |
 | `maxRequestBody` | 16 MiB | bytes in a proxied request body: a larger `Content-Length` gets `413` at once, a chunked body as soon as it goes over |
 | `trustRequestId` | `false` | keep a client's well-formed `X-Request-Id` instead of making one (see [Request IDs](running.md#request-ids)) |
 | `http2` | `true` | serve [HTTP/2](#http2): `h2` by ALPN on TLS listeners, and with prior knowledge on plain ones |
-| `trustedProxies` | none | up to 64 addresses or prefixes (`'10.0.0.0/8'`, `'::1'`) whose `X-Forwarded-For` names the client: for [rate limits](#rate-limits), the `X-Forwarded-For` sent upstream and the [access log](running.md#access-logs) |
+| `trustedProxies` | none | up to 64 addresses or prefixes (`'10.0.0.0/8'`, `'::1'`) whose `X-Forwarded-For` names the client: for [limits](#limits), the `X-Forwarded-For` sent upstream and the [access log](running.md#access-logs) |
 
 Timeouts are seconds (fractions allowed, 0.05–3600) and are checked four times a second.
 
@@ -166,7 +170,31 @@ A `304` has no body: it carries the validators, `vary` and the route's headers, 
 
 The access log writes a line per file response as for any other, with `aborted` when the connection went before the file did; the `files` counter counts the files, ranges and listings served (`200` and `206`).
 
-Not yet: several ranges in one response, and routes for single files.
+### Single files
+
+A route with a `file` serves that one file, with everything above: validators, conditions, ranges, precompressed copies, gzip on the fly and the small-file cache. With a `path` it is the file for that path; with a `prefix`, for every path under it, which is what a single-page app needs: its client-side routes all get `index.html`, while longer prefixes still go to their own routes.
+
+```js
+{ path: '/robots.txt', file: 'public/robots.txt' },
+{ path: '/favicon.ico', file: 'public/favicon.ico', headers: { 'cache-control': 'max-age=86400' } },
+// A single-page app: assets and the API first (longer prefixes win), then
+// index.html for every other path.
+{ prefix: '/assets/', root: 'dist/assets', headers: { 'cache-control': 'max-age=31536000, immutable' } },
+{ prefix: '/api/', proxy: 'api' },
+{ prefix: '/', file: 'dist/index.html', precompressed: true, headers: { 'cache-control': 'no-cache' } },
+```
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `file` | | the file, relative to the config file like a `root`. It must be a regular file when the config compiles, and not a symbolic link unless `followSymlinks`; if it goes away later, the route answers `404` until it is back. Its name may not start with `.`. |
+| `precompressed` | `false` | serve `name.br` or `name.gz` beside it (see above) |
+| `followSymlinks` | `false` | serve the file through a symbolic link |
+| `contentTypes` | | as above |
+| `headers` | none | as above |
+
+The content type comes from the file's name, not from the path asked for: `/app/settings` on the route above is `text/html`. The path after a prefix is not looked at at all, so nothing in it can be `400` or `404`. A single-file route answers `GET` and `HEAD`, and has no `root`, `index`, `listing`, `status`, `contentType`, `body`, `proxy` or `rewrite`.
+
+Not yet: several ranges in one response.
 
 ## Compression
 
@@ -205,7 +233,9 @@ Not yet: `br` or `zstd` on the fly (precompressed `.br` files are served), and a
 `upstreams` names groups of HTTP/1.1 servers, and a route with `proxy` forwards to one. Servers are addresses, or names the control plane resolves (see [Names](#names)); workers only ever see addresses.
 
 ```js
-export default {
+import { defineConfig } from 'xenia';
+
+export default defineConfig({
   upstreams: {
     api: {
       servers: ['127.0.0.1:9001', '[::1]:9002'],
@@ -217,7 +247,7 @@ export default {
     { path: '/upload', method: 'POST', proxy: 'api' },
     { path: '/', body: 'hello\n' },
   ],
-};
+});
 ```
 
 | Setting | Default | Meaning |
@@ -237,11 +267,13 @@ export default {
 
 A proxy route has no `status`, `contentType`, `headers` or `body`; without `method` it takes every method. With proxy routes, clients get half of the open-file budget toward `maxConnections`, since each one may hold a connection upstream too.
 
-**Requests.** The target goes upstream as sent (absolute-form becomes origin-form), or rewritten (see below), with the client's header fields except hop-by-hop ones (`Connection` and what it names, except `Host`, `Keep-Alive`, `Proxy-Connection`, `Proxy-Authorization`, `TE`, `Trailer`, `Transfer-Encoding`, `Upgrade`, all but a [WebSocket](#websockets) upgrade), `Expect` and the framing. `X-Forwarded-For` is replaced by the client's address, never appended to (behind `server.trustedProxies`, the client they name, as [rate limits](#rate-limits) find it), and `X-Forwarded-Proto` (`http` or `https`) is added, with what xenia saw of the client's certificate (see [Client certificates](#client-certificates)). What only a proxy may say is never taken from the client: its own `X-Forwarded-*` fields (`-Host`, `-Port`, `-Prefix` and any other), `Forwarded`, `X-Real-IP`, `X-Client-Verify` and `X-Client-Cert-*` are removed, so an upstream that builds URLs or redirects from them, trusting its proxy, cannot be told another host; `Host` passes through, or is added for HTTP/1.0 clients that sent none. A path that an upstream could read as a different one is refused with `400`: `.` or `..` segments, empty segments, backslashes, and escaped `/`, `\`, NUL or unreserved characters. `Expect: 100-continue` is answered by xenia.
+**Requests.** The target goes upstream as sent (absolute-form becomes origin-form), or rewritten (see below), with the client's header fields except hop-by-hop ones (`Connection` and what it names, except `Host`, `Keep-Alive`, `Proxy-Connection`, `Proxy-Authorization`, `TE`, `Trailer`, `Transfer-Encoding`, `Upgrade`, all but a [WebSocket](#websockets) upgrade), `Expect` and the framing. `X-Forwarded-For` is replaced by the client's address, never appended to (behind `server.trustedProxies`, the client they name, as [limits](#limits) find it), and `X-Forwarded-Proto` (`http` or `https`) is added, with what xenia saw of the client's certificate (see [Client certificates](#client-certificates)). What only a proxy may say is never taken from the client: its own `X-Forwarded-*` fields (`-Host`, `-Port`, `-Prefix` and any other), `Forwarded`, `X-Real-IP`, `X-Client-Verify` and `X-Client-Cert-*` are removed, so an upstream that builds URLs or redirects from them, trusting its proxy, cannot be told another host; `Host` passes through, or is added for HTTP/1.0 clients that sent none. A path that an upstream could read as a different one is refused with `400`: `.` or `..` segments, empty segments, backslashes, and escaped `/`, `\`, NUL or unreserved characters. `Expect: 100-continue` is answered by xenia.
 
 **Bodies** stream in both directions and are framed anew on each side: `Content-Length` passes through, chunked is decoded and encoded again without extensions or trailers, and a response body that ends when the upstream closes reaches HTTP/1.1 clients chunked. HTTP/1.0 clients get any unsized response body delimited by closing the connection. Neither side outruns the other: a slow client pauses reading from the upstream and a slow upstream pauses reading from the client. A request body must move at least 1 KiB per `headerTimeout` while it is uploading. If the response arrives before the request body is through, it is forwarded at once and the rest of the body is read and dropped; the connection then closes. A route with `compress: true` gzips the responses worth it on the way (see [Compression](#compression)).
 
 **Failures.** Requests go to a group's servers as its `balance` says, skipping servers drained through the [admin interface](running.md#admin-interface) and those [health checks](#balancing-and-health-checks) found unhealthy. A failed or timed-out connect marks the server down on that worker for `downTime` and tries the next one; when every server is down, the one back soonest is tried. When only unhealthy servers are left, requests go to them anyway. A group whose servers are all drained answers `503`. Running out of file descriptors, memory or local ports never marks a server down. Before the response head is forwarded, a failure is answered with `502 Bad Gateway`, or `504 Gateway Timeout` after `responseTimeout`; the client connection stays open if the request was read whole. After it, the client connection is reset, so a cut-off body never looks complete. Interim responses (`100`, `103`) are dropped; a `101` that is not a [WebSocket](#websockets) one, and malformed or ambiguous framing, are `502`.
+
+**A client that leaves.** A client that closes its connection, or only its side of it, while its request is all sent and the upstream has not begun to answer has given up waiting: xenia ends the exchange, closing the upstream connection, rather than keep the upstream at work for nobody. The access log line has `"status": null` and `"aborted": true`. Once the response has begun, a client that closes only its side still gets all of it.
 
 **Connection reuse.** An upstream connection is kept for the next request only after a complete exchange with a server that allows it: not HTTP/1.0, not `Connection: close`, nothing after the response. If a kept connection turns out to be closed before any response byte arrives, the request is sent once more on a new one, but only if the server never got it, or for `GET`, `HEAD` or `OPTIONS` without a body.
 
@@ -262,7 +294,9 @@ Not yet: HTTP/2 upstreams, upgrades other than WebSocket, rewriting by pattern, 
 A server may be a name, `host:port`, as containers and Kubernetes give them. The control plane resolves it and puts its addresses in the snapshots; workers never look a name up, and see only addresses.
 
 ```js
-export default {
+import { defineConfig } from 'xenia';
+
+export default defineConfig({
   upstreams: {
     app: {
       servers: ['app.default.svc.cluster.local:8080', '10.0.0.9:8080'],  // names and addresses mix
@@ -270,7 +304,7 @@ export default {
     },
   },
   routes: [{ prefix: '/', proxy: 'app' }],
-};
+});
 ```
 
 - **Every address is a server.** A name stands for each address it resolves to (A and AAAA records, unless `family` says one), each with its own pooled connections, down marks and health checks, balanced like listed ones. A group has at most 64 servers: addresses past that are left out, and the log says how many. An address that two entries share is one server.
@@ -288,7 +322,9 @@ Not yet: DNS TTLs, SRV records, and names in a health check's `host` or in liste
 ## Balancing and health checks
 
 ```js
-export default {
+import { defineConfig } from 'xenia';
+
+export default defineConfig({
   upstreams: {
     api: {
       servers: ['10.0.0.5:8080', '10.0.0.6:8080'],
@@ -297,7 +333,7 @@ export default {
     },
   },
   routes: [{ prefix: '/api/', proxy: 'api' }],
-};
+});
 ```
 
 **Balancing.** `round-robin` takes the servers in turn. `least-connections` sends each request to the server with the fewest requests in flight, a WebSocket tunnel counting as one; ties go in turn. Each worker counts its own, so at light load the counts mostly tie and the servers take turns. `/upstreams` shows the counts summed over the workers (`active`).
@@ -337,13 +373,15 @@ A WebSocket upgrade goes through any proxy route: an HTTP/1.1 `GET` without a bo
 A route with `host` serves only requests for that host. Routes without one form the default site, which serves every host no route names.
 
 ```js
-export default {
+import { defineConfig } from 'xenia';
+
+export default defineConfig({
   routes: [
     { host: 'example.com', path: '/', body: 'example.com\n' },
     { host: '*.example.com', path: '/', body: 'a subdomain\n' },
     { path: '/', body: 'everything else\n' },
   ],
-};
+});
 ```
 
 - `host` is a DNS name, or `*.` and one, compared without case. A wildcard covers exactly one more label: `*.example.com` serves `www.example.com`, but neither `example.com` nor `a.b.example.com`.
@@ -358,7 +396,9 @@ export default {
 `flags` declares feature flags and their values. A route with `flag` is served only while its flag is on, or, with `!` in front, only while it is off. Flags can be changed live through the [admin interface](running.md#admin-interface), so a route can be switched on or off, or a site moved to another upstream group, without editing the config.
 
 ```js
-export default {
+import { defineConfig } from 'xenia';
+
+export default defineConfig({
   flags: { green: false, exports: true },
   upstreams: {
     blue: { servers: ['10.0.0.5:8080'] },
@@ -369,7 +409,7 @@ export default {
     { prefix: '/', proxy: 'green', flag: 'green' },   // ...and this one while it is on
     { path: '/export', proxy: 'blue', flag: 'exports' },
   ],
-};
+});
 ```
 
 - A flag name is 1–32 lowercase letters, digits, `_` or `-`, and starts with a letter. A config has at most 64 flags.
@@ -377,29 +417,38 @@ export default {
 - Two routes on one path whose methods overlap conflict unless they sit on opposite sides of one flag, as `blue` and `green` do above. So no setting of the flags can make both serve, and changing a flag can never cause a conflict.
 - Each snapshot keeps the routes that are off, so a flag change needs no recompile. It publishes a new generation, as a reload does.
 
-## Rate limits
+<a id="rate-limits"></a> <!-- the section's name before 0.16.0, for old links -->
 
-`limits` names rate limits, and a route with `limit` counts each client's requests against one. A client over it gets `429 Too Many Requests` with a `retry-after`, before anything else happens for the request: nothing is proxied, no file is opened.
+## Limits
+
+`limits` names limits per client, and a route with `limit` counts each client's requests against one: a rate (requests a second), requests in flight (at once), or both. A client over it gets `429 Too Many Requests` with a `retry-after`, before anything else happens for the request: nothing is proxied, no file is opened.
 
 ```js
-export default {
+import { defineConfig } from 'xenia';
+
+export default defineConfig({
   server: { trustedProxies: ['10.0.0.0/8'] },        // the load balancers in front
   limits: {
-    api:   { rate: 10, burst: 20 },                  // 10 a second, 20 at once
-    login: { rate: 1 / 60, burst: 5 },               // 5 at once, then one a minute
+    api:     { rate: 10, burst: 20, inFlight: 8 },   // 10 a second, 20 at once, 8 open
+    login:   { rate: 1 / 60, burst: 5 },             // 5 at once, then one a minute
+    exports: { inFlight: 2 },                        // slow ones: 2 at a time
   },
   routes: [
     { prefix: '/api/', proxy: 'app', limit: 'api' },
     { path: '/login', method: 'POST', proxy: 'app', limit: 'login' },
+    { prefix: '/export/', proxy: 'app', limit: 'exports' },
   ],
-};
+});
 ```
 
 | Field | Default | Meaning |
 | --- | --- | --- |
 | `rate` | | requests a second, fractions allowed: from one a day to a million a second |
-| `burst` | the rate rounded up, at least 1 | how many may come at once, after a quiet spell; 1 to 1,000,000 |
-| `clients` | 65,536 | how many clients the limit keeps track of at once, 1,024 to 4,194,304; about 24 bytes each |
+| `burst` | the rate rounded up, at least 1 | with a `rate`: how many may come at once, after a quiet spell; 1 to 1,000,000 |
+| `inFlight` | | requests a client may have open at once on the limit's proxy and file routes, 1 to 65,536 |
+| `clients` | 65,536 | how many clients the limit keeps track of at once, 1,024 to 4,194,304; about 24 bytes each, for each of rate and `inFlight` |
+
+A limit has a `rate`, an `inFlight`, or both.
 
 - **The algorithm** is the generic cell rate algorithm, a token bucket kept as one timestamp per client: requests may come `burst` at once, then one every `1/rate` seconds. A refused request costs nothing, so a client that keeps trying waits no longer than one that waits. `retry-after` is the whole seconds until a request would pass.
 - **Routes that name one limit share it:** a client's requests to `/api/` and to `/login` above count separately, but every method and path under `/api/` counts against the same budget. `HEAD` counts as `GET`. A limit no route names does nothing; up to 64 limits.
@@ -408,27 +457,37 @@ export default {
 
 **The client** is the connection's address, without its port; IPv6 by its /64, which one host has to itself. When the connection comes from one of `server.trustedProxies`, the client is who they say: `X-Forwarded-For` (all of its fields, in order) is read from the right, skipping trusted addresses, and the first one that is not trusted is the client. A client cannot choose its address by sending its own `X-Forwarded-For`, since the proxy appends the address it saw. With every address trusted, the leftmost counts; a malformed entry ends the walk, and the address to its right counts.
 
+**In flight.** With `inFlight`, a client may have that many requests open at once on the limit's proxy and file routes; the next one gets `429` with `retry-after: 1`, and the one after a request ends goes on. Static routes answer at once and hold nothing in flight, but count against the limit's rate. A request is in flight from when it passes until its response is sent, or it fails, or its client resets the connection. A WebSocket counts until it closes, so `inFlight` also bounds a client's open WebSockets. Each HTTP/2 stream counts as one request. The in-flight check comes before the rate, so a request refused for being in flight spends nothing of the rate, and one the rate refuses gives its place back at once. A client that closes its connection while it waits for the upstream gives its place back at once (see [A client that leaves](#upstreams-and-proxying)). The counts are shared by every worker in a table like the rate's, and a reload or a live change keeps them. An entry that is counting is never forgotten: if a table has no room for a new client, which takes far more clients at once than `clients`, its request passes uncounted and `overflow` says so.
+
 **Over the limit:** `429` with `retry-after`, `content-type: text/plain` and `too many requests`, over HTTP/1.1 and HTTP/2 alike. On HTTP/1.1 the connection closes after it when the request had a body, which is not read.
 
-`/snapshot` lists the limits with what they counted (`allowed`, `refused`, `evicted`), `trustedProxies`, and each route's `limit`; `xenia check` lists them too. The counter `status_429` and `xenia_ratelimit_requests_total{limit,result}` are in `/stats` and `/metrics`.
+`/snapshot` lists the limits with what they counted (`allowed`, `refused`, `evicted` for the rate; `inFlightNow`, `inFlightRefused`, `inFlightOverflow`), `trustedProxies`, and each route's `limit`; `xenia check` lists them too. The counter `status_429`, `xenia_ratelimit_requests_total{limit,result}` and, for limits with `inFlight`, `xenia_limit_in_flight{limit}`, `xenia_limit_in_flight_refused_total{limit}` and `xenia_limit_in_flight_overflow_total{limit}` are in `/stats` and `/metrics`.
 
 The same client is the `X-Forwarded-For` that goes upstream and the access log's `client`.
 
-Not yet: limits on connections or on requests in flight, keys other than the client's address, and waiting instead of refusing.
+**Connections per client.** `server.maxConnectionsPerClient` bounds the connections one address may have open at once, over every listener: one more is closed as soon as it is accepted, before anything is read from it, so a client that opens connections it never uses runs out of them, not the server. It is off unless set, since an office or a phone network may put many people behind one address. The client is the connection's own address, IPv6 by its /64; `X-Forwarded-For` is not known yet when a connection is accepted. So `trustedProxies` are not counted at all: a load balancer's connections carry many clients, and its clients are bounded by limits with `inFlight`, which do know them. A reload that lowers the limit leaves open connections open, and refuses new ones until a client is under it. `xenia_client_connections_refused_total` counts the connections closed for it, and `xenia_client_connections_overflow_total` those let through because its table had no room, which takes far more clients than `maxConnections`.
+
+```js
+server: { maxConnectionsPerClient: 64, trustedProxies: ['10.0.0.0/8'] },
+```
+
+Not yet: keys other than the client's address, and waiting instead of refusing.
 
 ## Caching
 
 `caches` names response caches in memory, and a proxy route with `cache` keeps its upstream's responses in one, to answer later requests for them without going upstream. A cache is shared by every worker and outlives reloads.
 
 ```js
-export default {
+import { defineConfig } from 'xenia';
+
+export default defineConfig({
   caches: { pages: { size: 256 * 1024 * 1024 } },            // bytes
   upstreams: { app: { servers: ['10.0.0.5:8080'] } },
   routes: [
     { prefix: '/', proxy: 'app', cache: 'pages', ttl: 60 },   // ttl: when the upstream says nothing
     { prefix: '/api/', proxy: 'app' },                         // not cached
   ],
-};
+});
 ```
 
 | Field | Default | Meaning |
@@ -462,7 +521,7 @@ Xenia caches as a shared cache must ([RFC 9111](https://www.rfc-editor.org/rfc/r
 - **While revalidating:** every request that finds it within the window is answered from it at once, with `x-cache: stale`, `HEAD` included; none waits. The first one hands the revalidation to a **refresh**: the same request, with the entry's validators, forwarded by the worker with no client behind it, whose `304` renews the entry and whose keepable `200` replaces it. A refresh that gets nothing it can keep leaves the entry as it was, for the next request to refresh. A client asking for `no-cache` revalidates as before. A worker runs at most 64 refreshes at once (past that, a request revalidates itself), refreshes are not in the access log, and a shutdown cancels those in flight rather than wait.
 - **When the upstream fails:** a request that had an entry within its window to go by, and gets `502`, `503` or `504` from xenia (no connection, a timeout, every server drained) or `500`, `502`, `503` or `504` from the upstream, is answered from it instead, with `x-cache: stale-error`. The upstream's body is not read. Other statuses go through, and so does everything once the window has passed.
 
-**Coalescing.** The first miss for a key fetches it; requests for the same key meanwhile, on any worker, wait for that (up to the upstream group's `responseTimeout`) and are then answered from what was kept, as hits. If it could not be kept, or failed, each goes upstream itself. A waiting HTTP/1.1 connection reads no further requests; on HTTP/2 only that stream waits.
+**Coalescing.** The first miss for a key fetches it; requests for the same key meanwhile, on any worker, wait for that (up to the upstream group's `responseTimeout`) and are then answered from what was kept, as hits. If it could not be kept, or failed, each goes upstream itself. When the client whose miss started the fetch leaves while others wait, the fetch goes on without it, as a refresh, until the waiters would stop waiting for it (`connectTimeout` and twice `responseTimeout` from its start), and they get its answer rather than each going upstream again. A waiting HTTP/1.1 connection reads no further requests; on HTTP/2 only that stream waits.
 
 **gzip.** On a route with `compress`, what is kept is the upstream's body as it came. The first hit from a client that takes gzip makes a gzip copy on the threadpool, at level 6, and keeps it beside the entry; later ones get it with its length, as static bodies are.
 
@@ -472,7 +531,7 @@ Xenia caches as a shared cache must ([RFC 9111](https://www.rfc-editor.org/rfc/r
 
 **Purging.** `xenia ctl cache purge pages prefix=/blog/` (`POST /cache/purge?cache=pages&prefix=/blog/`) drops entries under a prefix; `path=/x` those for a path, with any query; neither, all of them; `host=example.com` limits it to one host. It answers with how many went.
 
-`/snapshot` lists the caches with their entries, bytes and counts (`hits`, `misses`, `revalidated`, `bypassed`, `stale`, `staleErrors`, `refreshes`, `refreshFailures`, `stored`, `evicted`, `purged`), and each route's `cache`, `ttl`, `staleWhileRevalidate` and `staleIfError`; `xenia check` lists them. The counters `cache_hits` (stale answers among them) and `cache_misses`, and `xenia_cache_requests_total{cache,result}`, `xenia_cache_entries`, `xenia_cache_bytes`, `xenia_cache_stored_total`, `xenia_cache_evicted_total`, `xenia_cache_refreshes_total` and `xenia_cache_refresh_failures_total`, are in `/stats` and `/metrics`. A `stale-error` answer counts as the `miss` it began as, as `revalidated` does.
+`/snapshot` lists the caches with their entries, bytes and counts (`hits`, `misses`, `revalidated`, `bypassed`, `stale`, `staleErrors`, `refreshes`, `refreshFailures`, `fillsContinued`, `waited` (requests that waited for another's fill), `stored`, `evicted`, `purged`), and each route's `cache`, `ttl`, `staleWhileRevalidate` and `staleIfError`; `xenia check` lists them. The counters `cache_hits` (stale answers among them) and `cache_misses`, and `xenia_cache_requests_total{cache,result}`, `xenia_cache_entries`, `xenia_cache_bytes`, `xenia_cache_stored_total`, `xenia_cache_evicted_total`, `xenia_cache_refreshes_total`, `xenia_cache_refresh_failures_total` and `xenia_cache_fills_continued_total`, are in `/stats` and `/metrics`. A `stale-error` answer counts as the `miss` it began as, as `revalidated` does.
 
 Not yet: keeping caches on disk, ranges from kept bodies, caching static and file routes (they have their own), client `Cache-Control` beyond `no-store` and `no-cache` (`max-stale`, `min-fresh`, `stale-if-error`), and purging by tag.
 
@@ -485,10 +544,12 @@ xenia --listen 0.0.0.0:80 --listen-tls 0.0.0.0:443     # ./xenia.conf.js
 ```
 
 ```js
+import { defineConfig } from 'xenia';
+
 // ACME HTTP-01 challenges, answered over plain HTTP.
 const acme = { prefix: '/.well-known/acme-challenge/', proxy: 'acme', allowHttp: true };
 
-export default {
+export default defineConfig({
   tls: {
     certificates: [
       { cert: 'certs/example.com.pem', key: 'certs/example.com.key' },   // the default
@@ -504,7 +565,7 @@ export default {
     acme,
     { path: '/', body: 'example.com\n' },
   ],
-};
+});
 ```
 
 | Setting | Default | Meaning |
@@ -513,6 +574,7 @@ export default {
 | `minVersion` | `'1.2'` | `'1.2'` or `'1.3'` |
 | `sessionTickets` | `true` | session resumption by ticket |
 | `redirect` | `false` | plain HTTP requests get `308` to the same host and target over HTTPS |
+| `redirectPort` | the first `--listen-tls` port | the port redirects name, 1–65535; needs `redirect` |
 | `hsts` | `false` | `true` (a year), or `{ maxAge, includeSubDomains, preload }` with `maxAge` in seconds: the `Strict-Transport-Security` header on every TLS response |
 
 **Certificates** are read whenever the config is compiled, at startup and on every `SIGHUP`, and travel with the compiled config: the snapshot is the file plus the files it names, with live changes on top. A key that does not match its certificate, a certificate that has expired or is not yet valid, and two certificates naming the same host are errors, which keep the current snapshot serving; one that expires within 14 days is logged. Each serves the DNS names in its subject alternative names, or its common name if it has none. Private keys are wiped from memory once parsed. A `--listen-tls` without `tls.certificates` stops startup, and a reload that removes them is refused.
@@ -525,7 +587,7 @@ export default {
 
 **Resumption.** Session tickets are sealed with one AES-256-GCM key per process, which Mbed TLS rotates daily. A client resumes on whichever worker it lands, and across reloads, but not across restarts. TLS 1.3 resumption still runs an (EC)DHE exchange.
 
-**Redirect and HSTS.** With `redirect`, a request on a plain listener gets `308 Permanent Redirect` to `https://` its host and target. The port is the first `--listen-tls` listener's, left out when it is 443. Routes with `allowHttp: true` are served over plain HTTP all the same, for ACME HTTP-01 challenges and health checks. Like any route, one belongs to its site: a host with a site of its own needs its own copy, as in the example above. A request without a `Host` has nowhere to go and gets `400`. With `hsts`, every response on a TLS connection carries `Strict-Transport-Security`: static, error and proxied ones, unless the upstream sent its own. Plain HTTP responses never do.
+**Redirect and HSTS.** With `redirect`, a request on a plain listener gets `308 Permanent Redirect` to `https://` its host and target. The port is `redirectPort`, or the first `--listen-tls` listener's without it, left out when it is 443. Behind port mapping, as in a container run with `-p 443:8443`, clients reach another port than xenia listens on: `redirectPort: 443` sends them there. Routes with `allowHttp: true` are served over plain HTTP all the same, for ACME HTTP-01 challenges and health checks. Like any route, one belongs to its site: a host with a site of its own needs its own copy, as in the example above. A request without a `Host` has nowhere to go and gets `400`. With `hsts`, every response on a TLS connection carries `Strict-Transport-Security`: static, error and proxied ones, unless the upstream sent its own. Plain HTTP responses never do.
 
 **Proxying.** For TLS clients the request carries `X-Forwarded-Proto: https`. Upstreams speak plain HTTP unless their group has `tls` (see [TLS to upstreams](#tls-to-upstreams)).
 
@@ -538,7 +600,9 @@ Not yet: OCSP stapling, certificates other than files, and listeners defined in 
 A certificate entry can ask clients for certificates, for the names it serves; a route can require a verified one.
 
 ```js
-export default {
+import { defineConfig } from 'xenia';
+
+export default defineConfig({
   tls: {
     certificates: [
       { cert: 'certs/example.com.pem', key: 'certs/example.com.key' },
@@ -555,7 +619,7 @@ export default {
     { host: 'api.example.com', prefix: '/', proxy: 'api' },
     { path: '/', body: 'example.com\n' },
   ],
-};
+});
 ```
 
 | Setting | Default | Meaning |
@@ -587,7 +651,9 @@ x-client-cert-fingerprint: 3f5c...   (SHA-256 of the certificate's DER, hex)
 An upstream group with `tls` connects to its servers over TLS. A server given as a [name](#names) is checked against that name; addresses need the group to name the server it expects.
 
 ```js
-export default {
+import { defineConfig } from 'xenia';
+
+export default defineConfig({
   upstreams: {
     api: {
       servers: ['10.0.0.5:443', '10.0.0.6:443'],
@@ -599,7 +665,7 @@ export default {
     },
   },
   routes: [{ prefix: '/api/', proxy: 'api' }],
-};
+});
 ```
 
 | Setting | Default | Meaning |
@@ -676,6 +742,8 @@ A drain sends `GOAWAY`; streams already open finish, and the connection closes a
 **Over TLS,** HTTP/2 needs TLS 1.3, or TLS 1.2 with an ECDHE suite and an AEAD cipher. Any other TLS 1.2 suite gets `GOAWAY INADEQUATE_SECURITY`.
 
 **Counters:** `h2_connections`, `h2_streams`, `h2_refused`, `h2_resets` (by the client) and `h2_goaways` (with an error), in `/stats`, `SIGUSR1` and `/metrics`.
+
+**Conformance.** [h2spec](https://github.com/summerwind/h2spec), the HTTP/2 conformance suite, runs against every release and every change to the HTTP/2 code, over TLS and with prior knowledge. Over TLS all 146 cases pass. With prior knowledge one doesn't, on purpose: on a plain listener, bytes that are not the preface are an HTTP/1.1 request, so h2spec's "invalid connection preface" gets `400` and a closed connection rather than a `GOAWAY`.
 
 Not supported:
 

@@ -1,7 +1,7 @@
 # GitHub Pages builds xenia-platform.github.io from this, with the docs
 # tools/site.sh copies next to it. Links between the .md files become links
 # between the pages; heading ids are made as on GitHub.
-title: xenia
+title: Xenia
 description: A web server and reverse proxy configured in JavaScript
 theme: jekyll-theme-primer
 permalink: pretty
